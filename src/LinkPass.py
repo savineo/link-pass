@@ -107,6 +107,8 @@ except Exception:
     _Argon2Type = None
 HAS_ARGON2: bool = _argon_hash_secret is not None and _Argon2Type is not None
 from cryptography.fernet import Fernet, InvalidToken
+class WrongMasterPasswordError(Exception):
+    pass
 def brand_icon(name: str) -> QIcon:
     try:
         p = resource_path(f"icons/{name}.png")
@@ -695,18 +697,25 @@ def secure_read_json(path: str, fernet: Fernet, default):
             data = f.read()
         if data.startswith(SECURE_JSON_PREFIX):
             enc = data[len(SECURE_JSON_PREFIX):]
-            raw = fernet.decrypt(enc)
-            return json.loads(raw.decode("utf-8"))
-        else:
             try:
-                obj = json.loads(data.decode("utf-8"))
-            except Exception:
-                with open(path, "r", encoding="utf-8") as fr:
-                    obj = json.load(fr)
+                raw = fernet.decrypt(enc)
+            except InvalidToken as e:
+                raise WrongMasterPasswordError("invalid master password") from e
+            return json.loads(raw.decode("utf-8"))
+        try:
+            obj = json.loads(data.decode("utf-8"))
+        except Exception:
+            with open(path, "r", encoding="utf-8") as fr:
+                obj = json.load(fr)
+        try:
             secure_write_json(path, obj, fernet)
-            return obj
-    except InvalidToken:
+        except Exception:
+            pass
+        return obj
+    except WrongMasterPasswordError:
         raise
+    except InvalidToken as e:
+        raise WrongMasterPasswordError("invalid master password") from e
     except Exception:
         return default
 def snapshot_now(prefix="blocks"):
@@ -5488,12 +5497,49 @@ def main():
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return 0
         master = dlg.value()
+        try:
+            win = MainWindow(master)
+        except Exception as e:
+            try:
+                custom_error(None, "Ошибка запуска", f"Не удалось инициализировать приложение:\n{e}")
+            except Exception:
+                pass
+            return 1
     else:
-        dlg = MasterPasswordDialog(None, first_run=False)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return 0
-        master = dlg.value()
-    win = MainWindow(master)
+        win = None
+        while True:
+            dlg = MasterPasswordDialog(None, first_run=False)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return 0
+            master = dlg.value()
+            try:
+                with open(MASTER_FILE, "r", encoding="utf-8") as f:
+                    j = json.load(f)
+                auth_salt = base64.b64decode(j.get("auth_salt", "") or b"")
+                kdf_name  = j.get("kdf", "argon2id")
+                kdf_params = j.get("kdf_params") or KDF_DEFAULTS
+                calc = hash_for_auth(master, auth_salt, prefer_argon=(kdf_name == "argon2id"), params=kdf_params)
+                if calc != j.get("verifier"):
+                    custom_error(None, "Мастер‑пароль", "Неверный мастер‑пароль. Попробуйте ещё раз.")
+                    continue
+            except Exception:
+                pass
+
+            try:
+                win = MainWindow(master)
+                break
+            except WrongMasterPasswordError:
+                try:
+                    custom_error(None, "Мастер‑пароль", "Неверный мастер‑пароль. Попробуйте ещё раз.")
+                except Exception:
+                    pass
+                continue
+            except Exception as e:
+                try:
+                    custom_error(None, "Ошибка запуска", f"Не удалось открыть хранилище:\n{e}")
+                except Exception:
+                    pass
+                return 1
     win.show()
     try:
         win.raise_()
